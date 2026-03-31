@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 from typing import Iterable, Literal
 from urllib.parse import unquote, urlparse
-from urllib.request import Request, urlopen
 
 import requests
 from dotenv import load_dotenv
@@ -23,23 +22,41 @@ from typing_extensions import Annotated, TypedDict
 SYSTEM_PROMPT = """You are a careful research assistant.
 
 Your job is to answer research and analysis questions with clear, structured, educational explanations.
+You operate fully autonomously toward the user's stated research goal.
+
+Autonomy rules:
+- Never ask the user follow-up questions.
+- Make reasonable assumptions when details are missing and explicitly list those assumptions.
+- Use available tools proactively until the goal is complete or evidence is sufficient.
+- For any web-search-related or latest-information task, always call tavily_web_search.
+- If Tavily results include PDF URLs, call download_pdfs and use those sources.
+- Cite URLs used in your final answer.
+- End every assistant message with exactly one of these lines:
+    GOAL_STATUS: IN_PROGRESS
+    GOAL_STATUS: COMPLETE
+
+Completion criteria:
+- Mark COMPLETE only when you provide a final synthesis that addresses the user's requested objective.
+- If you cannot complete due to missing public evidence, explain constraints and still mark COMPLETE.
+
 When the topic is health related:
 - Give general educational information.
 - Call out uncertainty when appropriate.
 - Avoid presenting the answer as medical diagnosis or personal medical advice.
 - Suggest consulting a qualified clinician for individual medical concerns.
-
-Tool rules:
-- For any web-search-related or latest-information task, always call tavily_web_search.
-- If the Tavily results include PDF URLs, call download_pdfs to save them to the local papers folder.
-- Base your final answer on the gathered sources and cite URLs in your response.
 """
 
 HEALTH_RESEARCH_EXAMPLES = [
     "How does our body digest protein from the moment we eat it to the point where amino acids are used by cells?",
-    "Find the latest credible research papers and PDF sources on protein digestion in humans, download the PDFs, and summarize key findings.",
-    "Search recent peer-reviewed articles about sleep quality and muscle protein synthesis, then summarize the evidence.",
+    "Research goal: evaluate whether high-protein diets improve satiety and body composition in adults. Scope: studies from 2019 onward, prioritize peer-reviewed human studies and meta-analyses. Deliverable: concise evidence summary, conflicting findings, and practical takeaways with source links.",
+    "Research goal: compare policy approaches for reducing urban air pollution in megacities. Scope: evidence from government reports and peer-reviewed studies from the last 5 years. Deliverable: strategy comparison table, tradeoffs, and recommended roadmap with citations.",
 ]
+
+AUTONOMY_NUDGE = (
+    "Continue autonomously toward the research goal. Use tools as needed. "
+    "Do not ask the user questions. If the objective is fully addressed, deliver the final report "
+    "and end with GOAL_STATUS: COMPLETE."
+)
 
 CREDIBLE_DOMAIN_HINTS = (
     ".gov",
@@ -70,6 +87,7 @@ CREDIBLE_DOMAIN_HINTS = (
 class ResearchState(TypedDict):
     messages: Annotated[list[AnyMessage], operator.add]
     llm_calls: int
+    goal_complete: bool
 
 
 def build_model() -> AzureChatOpenAI:
@@ -117,6 +135,20 @@ def _is_pdf_url(url: str) -> bool:
 def _looks_credible(url: str) -> bool:
     lowered = url.lower()
     return any(hint in lowered for hint in CREDIBLE_DOMAIN_HINTS)
+
+
+def _goal_complete_from_ai(content: object) -> bool:
+    text = str(content).upper()
+    return "GOAL_STATUS: COMPLETE" in text
+
+
+def _max_autonomous_steps() -> int:
+    raw = os.getenv("MAX_AUTONOMOUS_STEPS", "10")
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return 10
+    return max(parsed, 1)
 
 
 @tool
@@ -189,34 +221,18 @@ def download_pdfs(pdf_urls: list[str], output_dir: str = "papers") -> str:
             safe_name = f"{Path(name).stem}_{digest}.pdf"
             destination = target_dir / safe_name
 
-            headers = {
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    )
-            }
-
-            # response = requests.get(url, timeout=45)
-            # response.raise_for_status()
-
-            with requests.get(url, stream=True) as response:
+            with requests.get(url, stream=True, timeout=45) as response:
                 response.raise_for_status()
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "pdf" not in content_type and not _is_pdf_url(url):
+                    raise ValueError(
+                        f"Downloaded content is not PDF-like (Content-Type: {content_type})"
+                    )
 
                 with open(destination, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
-
-
-            content_type = response.headers.get("Content-Type", "").lower()
-
-            if "pdf" not in content_type and not _is_pdf_url(url):
-                raise ValueError(
-                    f"Downloaded content is not PDF-like (Content-Type: {content_type})"
-                )
-
-            destination.write_bytes(response.content)
             
             downloaded.append({"url": url, "saved_to": str(destination)})
         except Exception as exc:
@@ -245,6 +261,7 @@ def build_agent():
         return {
             "messages": [response],
             "llm_calls": state.get("llm_calls", 0) + 1,
+            "goal_complete": _goal_complete_from_ai(response.content),
         }
 
     def tool_node(state: ResearchState) -> ResearchState:
@@ -255,20 +272,41 @@ def build_agent():
             tool_messages.append(
                 ToolMessage(content=observation, tool_call_id=tool_call["id"])
             )
-        return {"messages": tool_messages, "llm_calls": state.get("llm_calls", 0)}
+        return {
+            "messages": tool_messages,
+            "llm_calls": state.get("llm_calls", 0),
+            "goal_complete": state.get("goal_complete", False),
+        }
 
-    def should_continue(state: ResearchState) -> Literal["tool_node", "__end__"]:
+    def autonomy_nudge(state: ResearchState) -> ResearchState:
+        return {
+            "messages": [HumanMessage(content=AUTONOMY_NUDGE)],
+            "llm_calls": state.get("llm_calls", 0),
+            "goal_complete": state.get("goal_complete", False),
+        }
+
+    def should_continue(
+        state: ResearchState,
+    ) -> Literal["tool_node", "autonomy_nudge", "__end__"]:
         last_message = state["messages"][-1]
         if getattr(last_message, "tool_calls", None):
             return "tool_node"
-        return END
+        if state.get("goal_complete", False):
+            return END
+        if state.get("llm_calls", 0) >= _max_autonomous_steps():
+            return END
+        return "autonomy_nudge"
 
     graph = StateGraph(ResearchState)
     graph.add_node("llm_call", llm_call)
     graph.add_node("tool_node", tool_node)
+    graph.add_node("autonomy_nudge", autonomy_nudge)
     graph.add_edge(START, "llm_call")
-    graph.add_conditional_edges("llm_call", should_continue, ["tool_node", END])
+    graph.add_conditional_edges(
+        "llm_call", should_continue, ["tool_node", "autonomy_nudge", END]
+    )
     graph.add_edge("tool_node", "llm_call")
+    graph.add_edge("autonomy_nudge", "llm_call")
     return graph.compile()
 
 
@@ -278,6 +316,7 @@ def run_query(query: str) -> dict:
         {
             "messages": [HumanMessage(content=query)],
             "llm_calls": 0,
+            "goal_complete": False,
         }
     )
 
@@ -301,6 +340,11 @@ def print_response(result: dict) -> None:
     if isinstance(final_message, AIMessage):
         print(_format_ai_content(final_message.content))
         print(f"\nLLM calls: {result['llm_calls']}")
+        if not result.get("goal_complete", False) and result.get("llm_calls", 0) >= _max_autonomous_steps():
+            print(
+                "Reached MAX_AUTONOMOUS_STEPS before explicit completion. "
+                "Increase MAX_AUTONOMOUS_STEPS if you want longer autonomous execution."
+            )
         return
 
     print(final_message)
@@ -313,12 +357,17 @@ def show_examples(examples: Iterable[str]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a LangGraph research agent with Tavily web search and PDF download tools."
+        description=(
+            "Run an autonomous LangGraph research agent with Tavily web search "
+            "and PDF download tools."
+        )
     )
     parser.add_argument(
         "query",
         nargs="?",
-        help="Research or analysis question for the agent to answer.",
+        help=(
+            "Research goal prompt. Provide full objective, scope, and desired output in this first input."
+        ),
     )
     parser.add_argument(
         "--examples",
