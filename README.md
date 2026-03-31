@@ -1,65 +1,72 @@
 # LangGraph Research Agent
 
-This project starts with a basic research and analysis agent built with the LangGraph Graph API in Python. It does not use tools yet, so the graph is intentionally simple: a single model node receives the conversation state and returns a response.
+This project is a LangGraph Graph API research agent in Python. It now includes tool calling for web research and PDF collection.
 
 ## What it does
 
-- Uses LangGraph's `StateGraph` API instead of the functional API.
-- Accepts a research-style query and returns a structured answer.
-- Includes health-focused example prompts, including protein digestion.
-- Keeps the design easy to extend with tools in a later step.
+- Uses LangGraph `StateGraph` with explicit nodes and edges.
+- Uses `tavily_web_search` for web search tasks that need up-to-date sources.
+- Uses `download_pdfs` to download PDF URLs into a local `papers` folder.
+- Supports health-focused research prompts, including protein digestion workflows.
 
 ## Project files
 
-- `src/research_agent.py`: Graph API agent implementation and CLI entry point.
-- `.env.example`: Environment variables for the model configuration.
-- `requirements.txt`: Minimal runtime dependencies.
+- `src/research_agent.py`: Graph API agent, Tavily search tool, and PDF download tool.
+- `.env.example`: Azure OpenAI + Tavily environment variable template.
+- `requirements.txt`: Runtime dependencies.
 
 ## Setup
 
-The virtual environment for this project was created at `.venv` before dependencies were installed.
-
-Activate it in PowerShell:
+Activate the virtual environment:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
-Create your local environment file:
+Install or refresh dependencies:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Create local env file:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Then add your OpenAI API key to `.env`.
+Set values in `.env`:
+
+- `AZURE_OPENAI_API_KEY`
+- `AZURE_OPENAI_ENDPOINT`
+- `AZURE_OPENAI_API_VERSION` (default in template is `2024-02-01`)
+- `RESEARCH_AGENT_MODEL` (Azure deployment name, default `gpt-4o`)
+- `TAVILY_API_KEY`
 
 ## Run the agent
 
-List the built-in example prompts:
+Show built-in examples:
 
 ```powershell
 .\.venv\Scripts\python.exe .\src\research_agent.py --examples
 ```
 
-Run the protein digestion example:
+Run a basic prompt:
 
 ```powershell
-.\.venv\Scripts\python.exe .\src\research_agent.py "How does our body digest protein from the moment we eat it to the point where amino acids are used by cells?"
+.\.venv\Scripts\python.exe .\src\research_agent.py "How does our body digest protein?"
 ```
 
-Run a different research question:
+Run a web-research prompt that should trigger both tools:
 
 ```powershell
-.\.venv\Scripts\python.exe .\src\research_agent.py "Compare how soluble fiber and insoluble fiber affect digestion, satiety, and gut health."
+.\.venv\Scripts\python.exe .\src\research_agent.py "Find recent credible research papers and PDF links about protein digestion, download the PDFs, then summarize the findings with source URLs."
 ```
 
-## How the graph is structured
+PDFs are stored in the local `papers` folder.
 
-The agent follows the Graph API pattern from the LangGraph quickstart:
+## Graph flow
 
-1. Define a typed state.
-2. Define a node that calls the model.
-3. Add `START -> researcher -> END` edges.
-4. Compile the graph and invoke it with a message list.
-
-This gives you a clean base for the next step, where we can add tools and conditional routing.
+1. `llm_call`: model decides whether to respond directly or call a tool.
+2. `tool_node`: executes requested tool calls (`tavily_web_search`, `download_pdfs`).
+3. Conditional edge loops back to `llm_call` until no more tool calls remain.
