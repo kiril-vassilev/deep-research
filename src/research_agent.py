@@ -87,6 +87,8 @@ CREDIBLE_DOMAIN_HINTS = (
     "arxiv.org",    
 )
 
+load_dotenv()
+DEBUG_MODE = os.getenv("DEBUG", "false").lower() == "true"
 
 class ResearchState(TypedDict):
     messages: Annotated[list[AnyMessage], operator.add]
@@ -95,7 +97,6 @@ class ResearchState(TypedDict):
 
 
 def build_model() -> AzureChatOpenAI:
-    load_dotenv()
 
     api_key = os.getenv("AZURE_OPENAI_API_KEY")
     if not api_key:
@@ -168,8 +169,6 @@ def tavily_web_search(query: str, max_results: int = 10) -> str:
     results = response.get("results", [])
     formatted_results: list[dict[str, str]] = []
     pdf_urls: list[str] = []
-
-    # pdf_urls.append("https://pmc.ncbi.nlm.nih.gov/articles/PMC12145679/pdf/main.pdf")
 
     for item in results:
         url = item.get("url", "")
@@ -353,7 +352,14 @@ def build_agent():
     tools_by_name = {tool_item.name: tool_item for tool_item in tools}
     model_with_tools = model.bind_tools(tools)
 
-    def llm_call(state: ResearchState) -> ResearchState:
+    def llm_node(state: ResearchState) -> ResearchState:
+
+        if DEBUG_MODE:
+            print("--------------------------------------------------------------")
+            print("LLM Node: ")
+            last_message = state["messages"][-1]
+            print(f"- {last_message.__class__.__name__} with content: {str(last_message.content)[:200]}")
+
         response = model_with_tools.invoke(
             [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
         )
@@ -364,9 +370,18 @@ def build_agent():
         }
 
     def tool_node(state: ResearchState) -> ResearchState:
+
+        if DEBUG_MODE:
+            print("--------------------------------------------------------------")
+            print("Tool Node: ")
+
         tool_messages: list[ToolMessage] = []
         for tool_call in state["messages"][-1].tool_calls:
             selected_tool = tools_by_name[tool_call["name"]]
+
+            if DEBUG_MODE:
+                print(f"- {selected_tool.name} called with args: {tool_call['args']}")
+
             observation = selected_tool.invoke(tool_call["args"])
             tool_messages.append(
                 ToolMessage(content=observation, tool_call_id=tool_call["id"])
@@ -377,35 +392,42 @@ def build_agent():
             "goal_complete": state.get("goal_complete", False),
         }
 
-    def autonomy_nudge(state: ResearchState) -> ResearchState:
+    def autonomy_nudge_node(state: ResearchState) -> ResearchState:
+
+        if DEBUG_MODE:
+            print("--------------------------------------------------------------")
+            print("Autonomy Nudge Node: ")
+
         return {
             "messages": [HumanMessage(content=AUTONOMY_NUDGE)],
             "llm_calls": state.get("llm_calls", 0),
             "goal_complete": state.get("goal_complete", False),
         }
 
-    def should_continue(
+    def determine_next_node(
         state: ResearchState,
-    ) -> Literal["tool_node", "autonomy_nudge", "__end__"]:
+    ) -> Literal["tool_node", "autonomy_nudge_node", "__end__"]:
+
         last_message = state["messages"][-1]
+
         if getattr(last_message, "tool_calls", None):
             return "tool_node"
         if state.get("goal_complete", False):
             return END
         if state.get("llm_calls", 0) >= _max_autonomous_steps():
             return END
-        return "autonomy_nudge"
+        return "autonomy_nudge_node"
 
     graph = StateGraph(ResearchState)
-    graph.add_node("llm_call", llm_call)
+    graph.add_node("llm_node", llm_node)
     graph.add_node("tool_node", tool_node)
-    graph.add_node("autonomy_nudge", autonomy_nudge)
-    graph.add_edge(START, "llm_call")
+    graph.add_node("autonomy_nudge_node", autonomy_nudge_node)
+    graph.add_edge(START, "llm_node")
     graph.add_conditional_edges(
-        "llm_call", should_continue, ["tool_node", "autonomy_nudge", END]
+        "llm_node", determine_next_node, ["tool_node", "autonomy_nudge_node", END]
     )
-    graph.add_edge("tool_node", "llm_call")
-    graph.add_edge("autonomy_nudge", "llm_call")
+    graph.add_edge("tool_node", "llm_node")
+    graph.add_edge("autonomy_nudge_node", "llm_node")
     return graph.compile()
 
 
