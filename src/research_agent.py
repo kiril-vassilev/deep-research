@@ -5,6 +5,7 @@ import hashlib
 import json
 import operator
 import os
+import re
 from pathlib import Path
 from typing import Iterable, Literal
 from urllib.parse import unquote, urlparse
@@ -15,6 +16,7 @@ from langchain.messages import AIMessage, AnyMessage, HumanMessage, SystemMessag
 from langchain.tools import tool
 from langchain_openai import AzureChatOpenAI
 from langgraph.graph import END, START, StateGraph
+from pypdf import PdfReader
 from tavily import TavilyClient
 from typing_extensions import Annotated, TypedDict
 
@@ -29,8 +31,10 @@ Autonomy rules:
 - Make reasonable assumptions when details are missing and explicitly list those assumptions.
 - Use available tools proactively until the goal is complete or evidence is sufficient.
 - For any web-search-related or latest-information task, always call tavily_web_search.
-- If Tavily results include PDF URLs, call download_pdfs and use those sources.
-- Cite URLs used in your final answer.
+- If Tavily results include PDF URLs, call download_pdfs to save them locally.
+- After downloading PDFs, call parse_pdfs_for_sections to extract key structured content (abstract, methods, findings).
+- Use extracted PDF sections to synthesize high-quality responses.
+- Cite URLs and paper titles in your final answer.
 - End every assistant message with exactly one of these lines:
     GOAL_STATUS: IN_PROGRESS
     GOAL_STATUS: COMPLETE
@@ -247,10 +251,105 @@ def download_pdfs(pdf_urls: list[str], output_dir: str = "papers") -> str:
     return json.dumps(payload, indent=2)
 
 
+def _extract_section(text: str, section_name: str) -> str:
+    """Extract a section from PDF text using regex patterns."""
+    # Common section headers with case-insensitive matching
+    section_patterns = {
+        "abstract": r"(?:^|\n)(?:ABSTRACT|Abstract)(?:\s|\n)([\s\S]*?)(?=\n(?:INTRODUCTION|INTRODUCTION|METHODS|1\.|\d\.\s|$))",
+        "methods": r"(?:^|\n)(?:METHODS|Methods)(?:\s|\n)([\s\S]*?)(?=\n(?:RESULTS|DISCUSSION|FINDINGS|CONCLUSION|\d\.\s|$))",
+        "findings": r"(?:^|\n)(?:FINDINGS|RESULTS|Findings|Results)(?:\s|\n)([\s\S]*?)(?=\n(?:DISCUSSION|CONCLUSION|LIMITATIONS|REFERENCES|\d\.\s|$))",
+        "discussion": r"(?:^|\n)(?:DISCUSSION|Discussion)(?:\s|\n)([\s\S]*?)(?=\n(?:CONCLUSION|REFERENCES|LIMITATIONS|$))",
+        "conclusion": r"(?:^|\n)(?:CONCLUSION|CONCLUSIONS|Conclusion)(?:\s|\n)([\s\S]*?)(?=\n(?:REFERENCES|ACKNOWLEDGMENTS|$))",
+    }
+    
+    pattern = section_patterns.get(section_name.lower())
+    if not pattern:
+        return ""
+    
+    match = re.search(pattern, text, re.IGNORECASE)
+    if match:
+        extracted = match.group(1).strip()
+        # Truncate to first 1500 chars to avoid token bloat
+        return extracted[:1500] if len(extracted) > 1500 else extracted
+    return ""
+
+
+@tool
+def parse_pdfs_for_sections(output_dir: str = "papers") -> str:
+    """Parse downloaded PDFs and extract structured sections (abstract, methods, findings, discussion)."""
+    
+    target_dir = Path(output_dir)
+    if not target_dir.exists():
+        return json.dumps({
+            "output_dir": str(target_dir),
+            "pdfs_found": 0,
+            "extracted": [],
+            "errors": ["Papers directory does not exist yet. Download PDFs first."],
+        }, indent=2)
+    
+    pdf_files = sorted(target_dir.glob("*.pdf"))
+    if not pdf_files:
+        return json.dumps({
+            "output_dir": str(target_dir),
+            "pdfs_found": 0,
+            "extracted": [],
+            "errors": ["No PDF files found in papers directory."],
+        }, indent=2)
+    
+    extracted: list[dict] = []
+    errors: list[str] = []
+    
+    for pdf_path in pdf_files:
+        try:
+            reader = PdfReader(pdf_path)
+            if len(reader.pages) == 0:
+                errors.append(f"{pdf_path.name}: PDF has no pages.")
+                continue
+            
+            # Extract text from first 10 pages (balance quality vs token count)
+            text = ""
+            for page_num in range(min(10, len(reader.pages))):
+                page = reader.pages[page_num]
+                text += page.extract_text() or ""
+            
+            if not text.strip():
+                errors.append(f"{pdf_path.name}: Could not extract text.")
+                continue
+            
+            sections = {
+                "abstract": _extract_section(text, "abstract"),
+                "methods": _extract_section(text, "methods"),
+                "findings": _extract_section(text, "findings"),
+                "discussion": _extract_section(text, "discussion"),
+                "conclusion": _extract_section(text, "conclusion"),
+            }
+            
+            # Only include sections that have content
+            sections = {k: v for k, v in sections.items() if v}
+            
+            extracted.append({
+                "filename": pdf_path.name,
+                "pages_processed": min(10, len(reader.pages)),
+                "total_pages": len(reader.pages),
+                "sections": sections,
+            })
+        except Exception as exc:
+            errors.append(f"{pdf_path.name}: {str(exc)}")
+    
+    payload = {
+        "output_dir": str(target_dir),
+        "pdfs_found": len(pdf_files),
+        "successfully_parsed": len(extracted),
+        "extracted": extracted,
+        "errors": errors,
+    }
+    return json.dumps(payload, indent=2)
+
+
 def build_agent():
     model = build_model()
 
-    tools = [tavily_web_search, download_pdfs]
+    tools = [tavily_web_search, download_pdfs, parse_pdfs_for_sections]
     tools_by_name = {tool_item.name: tool_item for tool_item in tools}
     model_with_tools = model.bind_tools(tools)
 
@@ -358,8 +457,8 @@ def show_examples(examples: Iterable[str]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run an autonomous LangGraph research agent with Tavily web search "
-            "and PDF download tools."
+            "Run an autonomous LangGraph research agent with Tavily web search, "
+            "PDF download, and PDF parsing tools for structured research synthesis."
         )
     )
     parser.add_argument(
